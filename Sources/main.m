@@ -22,7 +22,7 @@
 #import <objc/message.h>
 
 #define HK_BUNDLE_ID @"io.github.wangnov.hotspot-keeper"
-#define HK_VERSION   @"1.0.0"
+#define HK_VERSION   @"1.1.0"
 
 #pragma mark - Localization Helper (Auto Simplified Chinese / English)
 
@@ -113,7 +113,7 @@ static NSUserDefaults *hkPrefs(void) {
             @"targetName": @"",       // Empty = auto-pick first nearby same-Apple-Account iPhone
             @"paused": @NO,
             @"deadWifi": @NO,         // Also switch if Wi-Fi has no internet for 30s
-            @"offlineSeconds": @10,   // Seconds offline before auto-connecting
+            @"offlineSeconds": @6,    // Seconds offline before auto-connecting
         }];
     });
     return u;
@@ -350,17 +350,21 @@ static NSString *hkSafeDeviceSummary(id dev) {
 @property (nonatomic) BOOL cliWakeOnly;
 @property (nonatomic) BOOL cliForce;
 
+@property (nonatomic) BOOL lastKnownHasLink;
 @property (nonatomic) int downTicks;
 @property (nonatomic) int deadWifiTicks;
 @property (nonatomic) int tickCount;
 @property (nonatomic) int consecutiveFails;
 @property (nonatomic, strong) NSDate *lastAttemptAt;
+@property (nonatomic, strong) NSDate *lastBrowseRestartAt;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *memPasswords; // RAM-only cache, never persisted or logged
 @property (nonatomic) BOOL loggedTargetMissing;
 @property (nonatomic, copy) void (^onStateChanged)(void);
 
 - (id)matchingTargetDevice;
 - (NSArray<NSString *> *)discoveredDeviceNames;
 - (void)startBrowsing;
+- (void)restartBrowsingForce:(BOOL)force;
 - (void)tick;
 - (void)onNetworkEvent;
 - (void)onSystemWake;
@@ -374,6 +378,8 @@ static NSString *hkSafeDeviceSummary(id dev) {
     if (self) {
         _devices = @[];
         _internetOK = YES;
+        _lastKnownHasLink = hkHasPhysicalLink();
+        _memPasswords = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -390,6 +396,10 @@ static NSString *hkSafeDeviceSummary(id dev) {
 }
 
 - (void)startBrowsing {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self startBrowsing]; });
+        return;
+    }
     dlopen("/System/Library/PrivateFrameworks/Sharing.framework/Sharing", RTLD_NOW);
     Class cls = NSClassFromString(@"SFRemoteHotspotSession");
     if (!cls) {
@@ -399,8 +409,45 @@ static NSString *hkSafeDeviceSummary(id dev) {
     }
     self.session = [cls new];
     if (!self.session) return;
+    self.lastBrowseRestartAt = NSDate.date;
     [self.session setValue:self forKey:@"delegate"];
     ((void(*)(id, SEL))objc_msgSend)(self.session, NSSelectorFromString(@"startBrowsing"));
+}
+
+// 重建 SFRemoteHotspotSession：解决长连接/休眠唤醒/刚断开热点后 BLE 设备列表陈旧不刷新的问题
+- (void)restartBrowsingForce:(BOOL)force {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self restartBrowsingForce:force]; });
+        return;
+    }
+    if (!force && self.lastBrowseRestartAt && -self.lastBrowseRestartAt.timeIntervalSinceNow < 6.0) {
+        return;
+    }
+    if (self.session) {
+        @try {
+            SEL stopSel = NSSelectorFromString(@"stopBrowsing");
+            if ([self.session respondsToSelector:stopSel]) {
+                ((void(*)(id, SEL))objc_msgSend)(self.session, stopSel);
+            }
+            [self.session setValue:nil forKey:@"delegate"];
+        } @catch (NSException *ignored) {}
+        self.session = nil;
+    }
+    [self startBrowsing];
+}
+
+- (void)cachePassword:(NSString *)pw forSSID:(NSString *)ssid {
+    if (!ssid.length || !pw.length) return;
+    @synchronized (self.memPasswords) {
+        self.memPasswords[hkNormalizeName(ssid)] = [pw copy];
+    }
+}
+
+- (NSString *)cachedPasswordForSSID:(NSString *)ssid {
+    if (!ssid.length) return nil;
+    @synchronized (self.memPasswords) {
+        return self.memPasswords[hkNormalizeName(ssid)];
+    }
 }
 
 - (NSArray<NSString *> *)discoveredDeviceNames {
@@ -460,30 +507,37 @@ static NSString *hkSafeDeviceSummary(id dev) {
 
 - (NSTimeInterval)currentCooldown {
     switch (self.consecutiveFails) {
-        case 0: return 15;
-        case 1: return 30;
-        case 2: return 60;
+        case 0: return 8;
+        case 1: return 15;
+        case 2: return 30;
+        case 3: return 60;
         default: return 120;
     }
 }
 
 - (void)onSystemWake {
-    HKLog(@"%@", HKStr(@"系统已唤醒，重置冷却计数", @"System woke up; resetting backoff"));
+    HKLog(@"%@", HKStr(@"系统已唤醒，刷新蓝牙扫描并重置冷却计数", @"System woke up; refreshing BLE browse & resetting backoff"));
     self.lastAttemptAt = nil;
     self.consecutiveFails = 0;
     self.loggedTargetMissing = NO;
     self.downTicks = 1;
     self.deadWifiTicks = 0;
+    [self restartBrowsingForce:YES];
     [self notifyUI];
 }
 
 - (void)onNetworkEvent {
-    if (hkHasPhysicalLink()) {
+    BOOL nowHasLink = hkHasPhysicalLink();
+    if (nowHasLink) {
         self.downTicks = 0;
         if (hkOnHotspot()) {
             self.consecutiveFails = 0;
         }
+    } else if (self.lastKnownHasLink && !nowHasLink) {
+        // 刚刚掉线：提前刷新 BLE 扫描，避免原连接的热点仍被 Sharing 框架隐藏
+        [self restartBrowsingForce:NO];
     }
+    self.lastKnownHasLink = nowHasLink;
     [self notifyUI];
 }
 
@@ -499,9 +553,11 @@ static NSString *hkSafeDeviceSummary(id dev) {
     }
 
     BOOL hasLink = hkHasPhysicalLink();
+    self.lastKnownHasLink = hasLink;
     BOOL onHS = hkOnHotspot();
     BOOL paused = [hkPrefs() boolForKey:@"paused"];
-    int offlineThreshold = MAX(1, (int)([hkPrefs() integerForKey:@"offlineSeconds"] / 5));
+    // 定时器每 3 秒一次，offlineSeconds 默认 6 秒（连续 2 次断网触发）
+    int offlineThreshold = MAX(1, (int)(([hkPrefs() integerForKey:@"offlineSeconds"] + 2) / 3));
 
     NSString *reason = nil;
     BOOL forceSwitch = NO;
@@ -515,11 +571,11 @@ static NSString *hkSafeDeviceSummary(id dev) {
         self.downTicks++;
         if (self.downTicks >= offlineThreshold) {
             reason = [NSString stringWithFormat:HKStr(@"物理网卡断网 %d 秒", @"Physical link offline for %ds"),
-                      self.downTicks * 5];
+                      self.downTicks * 3];
         }
     } else {
         self.downTicks = 0;
-        if (self.tickCount % 3 == 0) {
+        if (self.tickCount % 5 == 0) { // 每 15 秒探测一次外网
             BOOL ok = hkInternetOK();
             if (ok != self.internetOK) {
                 self.internetOK = ok;
@@ -548,8 +604,8 @@ static NSString *hkSafeDeviceSummary(id dev) {
 }
 
 // Dual-channel reconnect:
-// 1. BLE Instant Hotspot (SFRemoteHotspotSession) first if target device is nearby -> wakes radio & fetches live SSID/password.
-// 2. Direct Wi-Fi Keychain join fallback when target is named and BLE hasn't discovered or couldn't wake it.
+// 1. BLE Instant Hotspot (SFRemoteHotspotSession) first — if target missing from cache, restart BLE browse and wait up to 3.5s.
+// 2. Direct Wi-Fi fallback using in-memory cached hotspot credentials (avoids Error -3900) or macOS Keychain.
 - (void)connectNow:(BOOL)force reason:(NSString *)reason {
     if (self.busy) return;
     self.busy = YES;
@@ -560,6 +616,24 @@ static NSString *hkSafeDeviceSummary(id dev) {
           reason, hkTargetDisplayName());
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (![self matchingTargetDevice]) {
+            // 主动刷新一次 BLE 扫描并最多等 3.5 秒，解决刚断开热点或长时间运行后扫描缓存陈旧问题
+            [self setPhaseAndNotify:[NSString stringWithFormat:HKStr(@"刷新蓝牙扫描 %@…", @"Scanning BLE for %@…"),
+                                     hkTargetDisplayName()]];
+            [self restartBrowsingForce:YES];
+            for (int w = 0; w < 14; w++) {
+                if ([self matchingTargetDevice]) break;
+                if (!force && !self.cliWakeOnly && hkHasPhysicalLink()) break;
+                usleep(250000); // 250ms
+            }
+        }
+
+        if (!force && !self.cliWakeOnly && hkHasPhysicalLink()) {
+            HKLog(@"%@", HKStr(@"期间检测到常规网络已恢复，取消切换热点", @"Regular network returned; skipping hotspot"));
+            [self finishAttemptWithSuccess:YES];
+            return;
+        }
+
         if ([self matchingTargetDevice]) {
             [self wakeViaBluetoothAttempt:1 force:force target:target];
             return;
@@ -600,8 +674,18 @@ static NSString *hkSafeDeviceSummary(id dev) {
         self.loggedTargetMissing = YES;
     }
     [self setPhaseAndNotify:[NSString stringWithFormat:HKStr(@"Wi-Fi 直连 %@…", @"Joining %@ via Wi-Fi…"), target]];
+
+    // 若内存里缓存了上次蓝牙唤醒拿到的密码，优先带密码直连，规避 macOS networksetup 无密码报 Error -3900
+    NSString *cachedPw = [self cachedPasswordForSSID:target];
     NSString *joinOut = nil;
-    BOOL joined = hkJoinWiFiSSID(target, nil, &joinOut);
+    BOOL joined = NO;
+    if (cachedPw.length > 0) {
+        joined = hkJoinWiFiSSID(target, cachedPw, &joinOut);
+    }
+    if (!joined) {
+        joined = hkJoinWiFiSSID(target, nil, &joinOut);
+    }
+
     if (joined) {
         for (int w = 0; w < 6; w++) {
             if (hkOnHotspot()) break;
@@ -614,6 +698,12 @@ static NSString *hkSafeDeviceSummary(id dev) {
         }
     } else if (joinOut.length > 0) {
         HKLog(HKStr(@"Wi-Fi 直连未命中：%@", @"Direct Wi-Fi join missed: %@"), joinOut);
+    }
+
+    // 如果 Wi-Fi 直连耗时期间蓝牙刚刷出了目标设备，立即补一次蓝牙唤醒
+    if ([self matchingTargetDevice]) {
+        [self wakeViaBluetoothAttempt:1 force:force target:target];
+        return;
     }
     [self finishAttemptWithSuccess:NO];
 }
@@ -666,6 +756,10 @@ static NSString *hkSafeDeviceSummary(id dev) {
         }
 
         HKLog(HKStr(@"蓝牙唤醒成功，热点已开启：%@", @"Hotspot awake: %@"), ssid);
+        [self cachePassword:pw forSSID:ssid];
+        if (target.length > 0) {
+            [self cachePassword:pw forSSID:target];
+        }
         if (self.cliWakeOnly) {
             [self finishAttemptWithSuccess:YES];
             return;
@@ -1155,7 +1249,7 @@ int main(int argc, char **argv) {
 
         static dispatch_source_t timer = nil;
         timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, watchQueue);
-        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
         dispatch_source_set_event_handler(timer, ^{
             [ctrl tick];
         });
