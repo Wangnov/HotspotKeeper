@@ -25,6 +25,7 @@ COMMON_FLAGS=(
   -framework Foundation
   -framework SystemConfiguration
   -framework CoreWLAN
+  -framework IOKit
 )
 
 if [[ "$UNIVERSAL" -eq 1 ]]; then
